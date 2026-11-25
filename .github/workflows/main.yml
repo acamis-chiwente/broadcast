@@ -1,4 +1,4 @@
-name: Build NTJHS IFP APK (Android 9.0 Compatible)
+name: Build NTJHS IFP APK (Android 9.0 Cloud Receiver)
 
 on:
   push:
@@ -11,7 +11,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Clean & Generate Android 9.0 Compatible Project
+      - name: Clean & Generate Android 9.0 Cloud Receiver Project
         run: |
           rm -rf app build.gradle settings.gradle gradle.properties *.kts
           mkdir -p app/src/main/java/tw/edu/ntpc/ntjhs/broadcast app/src/main/res/drawable
@@ -58,8 +58,8 @@ jobs:
                   applicationId "tw.edu.ntpc.ntjhs.broadcast"
                   minSdk 23
                   targetSdk 28
-                  versionCode 2
-                  versionName "1.1-Android9"
+                  versionCode 3
+                  versionName "1.2-CloudSync"
               }
               signingConfigs {
                   debug {
@@ -167,12 +167,12 @@ jobs:
                   root.setPadding(64, 64, 64, 64);
 
                   TextView title = new TextView(this);
-                  title.setText("新泰國中觸控大屏無聲廣播接收端");
+                  title.setText("新泰國中觸控大屏無聲廣播接收端 v1.2");
                   title.setTextSize(24f);
                   root.addView(title);
 
                   TextView hint = new TextView(this);
-                  hint.setText("純線上網頁版・免填伺服器 IP，只需輸入班級即可啟動：");
+                  hint.setText("純線上網頁版・免填伺服器 IP，只需輸入班級即可自動連線接收：");
                   hint.setTextSize(16f);
                   hint.setPadding(0, 24, 0, 16);
                   root.addView(hint);
@@ -180,11 +180,11 @@ jobs:
                   classInput = new EditText(this);
                   classInput.setHint("請輸入班級（例如：807 或 校史室）");
                   classInput.setText(prefs.getString("class_name", "807"));
-                  classInput.setTextSize(18f);
+                  classInput.setTextSize(20f);
                   root.addView(classInput);
 
                   Button startBtn = new Button(this);
-                  startBtn.setText("儲存班級並啟動常駐接收");
+                  startBtn.setText("儲存班級並啟動雲端常駐接收");
                   startBtn.setTextSize(18f);
                   startBtn.setOnClickListener(v -> {
                       String cls = classInput.getText().toString().trim();
@@ -201,14 +201,34 @@ jobs:
                           return;
                       }
                       Intent svc = new Intent(this, BroadcastOverlayService.class);
+                      svc.setAction("ACTION_RESTART_CLASS");
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                           startForegroundService(svc);
                       } else {
                           startService(svc);
                       }
-                      Toast.makeText(this, "已啟動 " + cls + " 大屏無聲廣播常駐", Toast.LENGTH_SHORT).show();
+                      Toast.makeText(this, "已啟動 " + cls + " 雲端無聲廣播常駐", Toast.LENGTH_SHORT).show();
                   });
                   root.addView(startBtn);
+
+                  Button testBtn = new Button(this);
+                  testBtn.setText("測試大屏最上層跑馬燈顯示");
+                  testBtn.setTextSize(16f);
+                  testBtn.setOnClickListener(v -> {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, "請先點擊上方按鈕並允許最上層顯示權限", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      Intent testSvc = new Intent(this, BroadcastOverlayService.class);
+                      testSvc.setAction("ACTION_TEST_BANNER");
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(testSvc);
+                      } else {
+                          startService(testSvc);
+                      }
+                  });
+                  root.addView(testBtn);
+
                   setContentView(root);
               }
           }
@@ -225,25 +245,77 @@ jobs:
           import android.content.SharedPreferences;
           import android.graphics.Color;
           import android.graphics.PixelFormat;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
           import android.os.Build;
           import android.os.Handler;
           import android.os.IBinder;
           import android.os.Looper;
+          import android.util.DisplayMetrics;
           import android.view.Gravity;
+          import android.view.View;
           import android.view.WindowManager;
+          import android.view.animation.LinearInterpolator;
+          import android.view.animation.TranslateAnimation;
+          import android.widget.LinearLayout;
           import android.widget.TextView;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.util.LinkedList;
+          import java.util.Queue;
+          import java.util.Random;
 
           public class BroadcastOverlayService extends Service {
               private static final String CHANNEL_ID = "ntjhs_silent_broadcast";
+              private static final String STREAM_URL = "https://ntfy.sh/ntjhs_silent_broadcast_ntpc_242/json";
               private WindowManager windowManager;
               private TextView statusBadge;
+              private View activeBroadcastView;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private final Queue<JSONObject> fifoQueue = new LinkedList<>();
+              private boolean isPlaying = false;
+              private volatile boolean running = true;
+              private HttpURLConnection activeConn;
+              private String lastHandledId = "";
 
               @Override
               public void onCreate() {
                   super.onCreate();
+                  windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
                   startAsForeground();
                   attachCornerStatusWidget();
+                  startCloudListenerThread();
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && intent.getAction() != null) {
+                      String act = intent.getAction();
+                      if ("ACTION_RESTART_CLASS".equals(act)) {
+                          updateBadge("🟡 " + getMyClassName() + " 重連中");
+                      } else if ("ACTION_TEST_BANNER".equals(act)) {
+                          try {
+                              JSONObject demo = new JSONObject();
+                              demo.put("dept", "資訊組測試");
+                              demo.put("mode", "marquee");
+                              demo.put("theme", "green");
+                              demo.put("duration", 10);
+                              demo.put("content", "【連線測試成功】" + getMyClassName() + " 觸控大屏已就緒，可即時接收網頁端無聲廣播！");
+                              enqueueOverlay(demo);
+                          } catch (Exception ignored) {}
+                      }
+                  }
+                  return START_STICKY;
+              }
+
+              private String getMyClassName() {
+                  SharedPreferences prefs = getSharedPreferences("NTJHS_IFP", MODE_PRIVATE);
+                  return prefs.getString("class_name", "807").trim();
               }
 
               private void startAsForeground() {
@@ -254,50 +326,276 @@ jobs:
                       if (nm != null) nm.createNotificationChannel(channel);
                       Notification n = new Notification.Builder(this, CHANNEL_ID)
                           .setContentTitle("新泰國中無聲廣播接收中")
-                          .setContentText("純淨模式常駐中（免設伺服器IP）")
+                          .setContentText("雲端純淨模式常駐中（免設伺服器IP）")
                           .setSmallIcon(android.R.drawable.ic_dialog_info)
                           .build();
                       startForeground(1001, n);
                   }
               }
 
-              private void attachCornerStatusWidget() {
-                  windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-                  SharedPreferences prefs = getSharedPreferences("NTJHS_IFP", MODE_PRIVATE);
-                  String cls = prefs.getString("class_name", "807");
-
-                  statusBadge = new TextView(this);
-                  statusBadge.setText("🟢 " + cls);
-                  statusBadge.setTextColor(Color.WHITE);
-                  statusBadge.setBackgroundColor(Color.argb(190, 15, 23, 42));
-                  statusBadge.setPadding(20, 12, 20, 12);
-                  statusBadge.setTextSize(14f);
-
-                  int layoutType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+              private int getOverlayLayoutType() {
+                  return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                       ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                       : WindowManager.LayoutParams.TYPE_PHONE;
+              }
+
+              private void attachCornerStatusWidget() {
+                  statusBadge = new TextView(this);
+                  statusBadge.setText("🟡 " + getMyClassName() + " 連線中");
+                  statusBadge.setTextColor(Color.WHITE);
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(Color.argb(200, 15, 23, 42));
+                  bg.setCornerRadius(20f);
+                  statusBadge.setBackground(bg);
+                  statusBadge.setPadding(22, 12, 22, 12);
+                  statusBadge.setTextSize(14f);
 
                   WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                       WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.WRAP_CONTENT,
-                      layoutType,
+                      getOverlayLayoutType(),
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                       PixelFormat.TRANSLUCENT);
                   params.gravity = Gravity.TOP | Gravity.END;
                   params.x = 24;
-                  params.y = 24;
+                  params.y = 78;
 
                   mainHandler.post(() -> {
                       if (windowManager != null) windowManager.addView(statusBadge, params);
                   });
               }
 
+              private void updateBadge(String text) {
+                  mainHandler.post(() -> {
+                      if (statusBadge != null) statusBadge.setText(text);
+                  });
+              }
+
+              private void startCloudListenerThread() {
+                  new Thread(() -> {
+                      int[] backoffs = new int[]{3000, 6000, 15000, 30000};
+                      int attempt = 0;
+                      Random rng = new Random();
+                      while (running) {
+                          try {
+                              URL url = new URL(STREAM_URL);
+                              activeConn = (HttpURLConnection) url.openConnection();
+                              activeConn.setConnectTimeout(15000);
+                              activeConn.setReadTimeout(90000);
+                              activeConn.setRequestProperty("Accept", "application/x-ndjson");
+
+                              int code = activeConn.getResponseCode();
+                              if (code == 200) {
+                                  attempt = 0;
+                                  updateBadge("🟢 " + getMyClassName() + " 雲端在線");
+                                  BufferedReader reader = new BufferedReader(
+                                      new InputStreamReader(activeConn.getInputStream(), StandardCharsets.UTF_8));
+                                  String line;
+                                  while (running && (line = reader.readLine()) != null) {
+                                      if (line.trim().isEmpty()) continue;
+                                      handleIncomingStreamLine(line);
+                                  }
+                                  reader.close();
+                              }
+                          } catch (Exception e) {
+                              updateBadge("🔴 " + getMyClassName() + " 重連中");
+                          } finally {
+                              if (activeConn != null) {
+                                  try { activeConn.disconnect(); } catch (Exception ignored) {}
+                              }
+                          }
+                          if (!running) break;
+                          int waitMs = backoffs[Math.min(attempt, backoffs.length - 1)] + rng.nextInt(2500);
+                          attempt++;
+                          try { Thread.sleep(waitMs); } catch (InterruptedException ignored) {}
+                      }
+                  }, "NTJHS-Cloud-Listener").start();
+              }
+
+              private void handleIncomingStreamLine(String line) {
+                  try {
+                      JSONObject envelope = new JSONObject(line);
+                      String event = envelope.optString("event", "");
+                      if (!"message".equals(event)) return;
+                      String rawMsg = envelope.optString("message", "");
+                      if (!rawMsg.startsWith("{")) return;
+
+                      JSONObject payload = new JSONObject(rawMsg);
+                      String id = payload.optString("id", "");
+                      if (!id.isEmpty() && id.equals(lastHandledId)) return;
+                      lastHandledId = id;
+
+                      String targetDevice = payload.optString("targetDevice", "both");
+                      if ("pc".equals(targetDevice)) return;
+
+                      if (isTargetForThisClass(payload)) {
+                          enqueueOverlay(payload);
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private boolean isTargetForThisClass(JSONObject payload) {
+                  if (payload.optBoolean("targetAll", false)) return true;
+                  String myCls = getMyClassName().replace("班", "").trim();
+                  if (myCls.isEmpty()) return true;
+                  JSONArray arr = payload.optJSONArray("targets");
+                  if (arr == null || arr.length() == 0) return true;
+                  for (int i = 0; i < arr.length(); i++) {
+                      String t = arr.optString(i, "").replace("班", "").trim();
+                      if (myCls.equalsIgnoreCase(t)) return true;
+                  }
+                  return false;
+              }
+
+              private void enqueueOverlay(JSONObject payload) {
+                  mainHandler.post(() -> {
+                      fifoQueue.offer(payload);
+                      playNextInQueue();
+                  });
+              }
+
+              private void playNextInQueue() {
+                  if (isPlaying || fifoQueue.isEmpty()) return;
+                  JSONObject item = fifoQueue.poll();
+                  if (item == null) return;
+                  isPlaying = true;
+
+                  String mode = item.optString("mode", "marquee");
+                  int durationSec = Math.max(6, item.optInt("duration", 12));
+
+                  if ("banner".equals(mode)) {
+                      showTopBannerCard(item, durationSec);
+                  } else {
+                      showTopMarqueeBar(item, durationSec);
+                  }
+              }
+
+              private void showTopMarqueeBar(JSONObject item, int durationSec) {
+                  removeActiveOverlay();
+                  String dept = item.optString("dept", "行政處室");
+                  String content = item.optString("content", "");
+                  String theme = item.optString("theme", "white");
+
+                  int bgColor = Color.WHITE;
+                  int textColor = Color.rgb(15, 23, 42);
+                  if ("red".equals(theme)) { bgColor = Color.rgb(220, 38, 38); textColor = Color.WHITE; }
+                  else if ("yellow".equals(theme)) { bgColor = Color.rgb(252, 211, 77); textColor = Color.rgb(15, 23, 42); }
+                  else if ("green".equals(theme)) { bgColor = Color.rgb(5, 150, 105); textColor = Color.WHITE; }
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+                  bar.setBackgroundColor(bgColor);
+                  bar.setPadding(24, 16, 24, 16);
+
+                  TextView badge = new TextView(this);
+                  badge.setText("📢 " + dept);
+                  badge.setTextColor(Color.WHITE);
+                  badge.setTypeface(Typeface.DEFAULT_BOLD);
+                  badge.setTextSize(20f);
+                  GradientDrawable tagBg = new GradientDrawable();
+                  tagBg.setColor(Color.rgb(15, 23, 42));
+                  tagBg.setCornerRadius(12f);
+                  badge.setBackground(tagBg);
+                  badge.setPadding(18, 8, 18, 8);
+                  bar.addView(badge);
+
+                  TextView marqueeTv = new TextView(this);
+                  marqueeTv.setText("   " + content + "   ");
+                  marqueeTv.setTextColor(textColor);
+                  marqueeTv.setTypeface(Typeface.DEFAULT_BOLD);
+                  marqueeTv.setTextSize(24f);
+                  marqueeTv.setSingleLine(true);
+                  marqueeTv.setPadding(24, 0, 24, 0);
+                  bar.addView(marqueeTv);
+
+                  WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      getOverlayLayoutType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT);
+                  params.gravity = Gravity.TOP;
+
+                  activeBroadcastView = bar;
+                  if (windowManager != null) windowManager.addView(bar, params);
+
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  float screenW = dm.widthPixels;
+                  marqueeTv.measure(View.MeasureSpec.UNSPECIFIED, View.MeasureSpec.UNSPECIFIED);
+                  float textW = Math.max(screenW, marqueeTv.getMeasuredWidth());
+                  TranslateAnimation anim = new TranslateAnimation(screenW * 0.85f, -textW, 0f, 0f);
+                  anim.setDuration(durationSec * 1000L);
+                  anim.setInterpolator(new LinearInterpolator());
+                  marqueeTv.startAnimation(anim);
+
+                  mainHandler.postDelayed(() -> finishCurrentOverlay(), durationSec * 1000L);
+              }
+
+              private void showTopBannerCard(JSONObject item, int durationSec) {
+                  removeActiveOverlay();
+                  String dept = item.optString("dept", "行政處室");
+                  String title = item.optString("title", "校園重要通知");
+                  String content = item.optString("content", "");
+
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  GradientDrawable cardBg = new GradientDrawable();
+                  cardBg.setColor(Color.argb(242, 15, 23, 42));
+                  cardBg.setCornerRadius(24f);
+                  cardBg.setStroke(3, Color.rgb(59, 130, 246));
+                  card.setBackground(cardBg);
+                  card.setPadding(36, 26, 36, 26);
+
+                  TextView headerTv = new TextView(this);
+                  headerTv.setText("📢 [" + dept + "] " + title);
+                  headerTv.setTextColor(Color.rgb(147, 197, 253));
+                  headerTv.setTypeface(Typeface.DEFAULT_BOLD);
+                  headerTv.setTextSize(24f);
+                  card.addView(headerTv);
+
+                  TextView bodyTv = new TextView(this);
+                  bodyTv.setText(content);
+                  bodyTv.setTextColor(Color.WHITE);
+                  bodyTv.setTextSize(20f);
+                  bodyTv.setPadding(0, 12, 0, 0);
+                  card.addView(bodyTv);
+
+                  WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      getOverlayLayoutType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT);
+                  params.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                  params.y = 20;
+
+                  activeBroadcastView = card;
+                  if (windowManager != null) windowManager.addView(card, params);
+                  mainHandler.postDelayed(() -> finishCurrentOverlay(), durationSec * 1000L);
+              }
+
+              private void finishCurrentOverlay() {
+                  removeActiveOverlay();
+                  isPlaying = false;
+                  playNextInQueue();
+              }
+
+              private void removeActiveOverlay() {
+                  if (windowManager != null && activeBroadcastView != null) {
+                      try { windowManager.removeView(activeBroadcastView); } catch (Exception ignored) {}
+                      activeBroadcastView = null;
+                  }
+              }
+
               @Override
               public void onDestroy() {
-                  super.onDestroy();
+                  running = false;
+                  removeActiveOverlay();
                   if (windowManager != null && statusBadge != null) {
-                      windowManager.removeView(statusBadge);
+                      try { windowManager.removeView(statusBadge); } catch (Exception ignored) {}
                   }
+                  super.onDestroy();
               }
 
               @Override
